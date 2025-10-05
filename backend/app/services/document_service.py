@@ -14,6 +14,7 @@ from app.models.tag import Tag
 from app.models.user import User
 from app.schemas.document import DocumentCreate, DocumentUpdate, DocumentSearchParams
 from app.core.config import settings
+from app.services.cache_service import CacheService
 
 
 class DocumentService:
@@ -94,6 +95,8 @@ class DocumentService:
         db.add(document)
         db.flush()
 
+        CacheService.delete_pattern(f"search:*")
+
         file_path, checksum, file_size = DocumentService.save_uploaded_file(
             file, document.id, 1
         )
@@ -168,6 +171,8 @@ class DocumentService:
         document.current_version = new_version_number
         document.updated_at = datetime.utcnow()
 
+        CacheService.delete_pattern(f"search:*")
+
         db.commit()
         db.refresh(version)
 
@@ -179,6 +184,16 @@ class DocumentService:
         user: User,
         params: DocumentSearchParams
     ) -> Tuple[List[Document], int]:
+        cache_key = f"search:{user.id}:{params.query or 'all'}:{','.join(sorted(params.tags or []))}:{params.uploader_id or ''}:{params.department_id or ''}:{params.page}:{params.page_size}:{params.sort_by}:{params.sort_order}"
+
+        cached_result = CacheService.get(cache_key)
+        if cached_result:
+            document_ids = [doc['id'] for doc in cached_result['documents']]
+            documents = db.query(Document).filter(Document.id.in_(document_ids)).all()
+            doc_map = {str(doc.id): doc for doc in documents}
+            ordered_documents = [doc_map[doc_id] for doc_id in document_ids if doc_id in doc_map]
+            return ordered_documents, cached_result['total']
+
         query = db.query(Document).filter(Document.is_deleted == False)
 
         if not user.role or user.role.name != "admin":
@@ -231,6 +246,12 @@ class DocumentService:
 
         offset = (params.page - 1) * params.page_size
         documents = query.offset(offset).limit(params.page_size).all()
+
+        cache_data = {
+            'documents': [{'id': str(doc.id)} for doc in documents],
+            'total': total
+        }
+        CacheService.set(cache_key, cache_data, ttl=300)
 
         return documents, total
 
@@ -306,6 +327,9 @@ class DocumentService:
             )
 
         document.is_deleted = True
+
+        CacheService.delete_pattern(f"search:*")
+
         db.commit()
 
         return True
